@@ -25,7 +25,7 @@ export function DownloadCTA() {
           Download for {build.label.replace("macOS — ", "Mac ").replace(" — ", " ")}
         </ButtonLink>
       ) : (
-        <ButtonLink size="lg" href="/download">
+        <ButtonLink size="lg" href="/api/download">
           <DownloadGlyph />
           Download
         </ButtonLink>

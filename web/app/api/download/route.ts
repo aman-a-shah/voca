@@ -1,35 +1,38 @@
 import { NextRequest, NextResponse } from "next/server";
 import { track } from "@vercel/analytics/server";
-import { BUILDS, latestAssetUrl, resolveBuild, type BuildKey } from "@/lib/releases";
+import { BUILDS, REPO_URL, resolveBuild, type BuildKey } from "@/lib/releases";
 
 export const runtime = "edge";
 
 /**
  * GET /api/download?os=mac&arch=arm64
- * 302-redirects to the correct latest GitHub Release asset. Unknown combos fall
- * back to the download page so the visitor can choose.
+ * 302-redirects to the GitHub repo, where the visitor picks the installer from
+ * the latest release. Deep-linking straight to a release asset used to land on
+ * a GitHub 404 whenever the published asset names drifted from `BUILDS`, so the
+ * repo is the one target that is always correct.
  *
  * Every real download button funnels through here, so this is also where we
  * count downloads: a server-side "download" event fires before the redirect,
  * which catches every platform and isn't affected by client-side ad-blockers.
- * Tracking is best-effort — a failure here must never block the download.
+ * Tracking is best-effort — a failure here must never block the download. The
+ * os/arch params are now only used for that count; unknown combos still
+ * redirect, just without a build attached.
  */
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const key = resolveBuild(searchParams.get("os"), searchParams.get("arch"));
-  if (!key) {
-    return NextResponse.redirect(new URL("/download", req.url), 302);
+  const build = key ? BUILDS[key] : null;
+  if (key && build) {
+    await Promise.all([
+      track("download", {
+        build: key,
+        os: build.platform,
+        arch: build.arch,
+      }).catch(() => {}),
+      trackGa(req, key, build).catch(() => {}),
+    ]);
   }
-  const build = BUILDS[key];
-  await Promise.all([
-    track("download", {
-      build: key,
-      os: build.platform,
-      arch: build.arch,
-    }).catch(() => {}),
-    trackGa(req, key, build).catch(() => {}),
-  ]);
-  return NextResponse.redirect(latestAssetUrl(build.asset), 302);
+  return NextResponse.redirect(REPO_URL, 302);
 }
 
 /**
