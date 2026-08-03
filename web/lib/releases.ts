@@ -19,6 +19,17 @@ export const REPO = process.env.NEXT_PUBLIC_GH_REPO || "aman-a-shah/voca";
 export const RELEASES_REPO =
   process.env.NEXT_PUBLIC_RELEASES_REPO || REPO;
 
+/**
+ * Where the "Download" buttons send people.
+ *
+ * Direct `releases/latest/download/<asset>` links only work while the published
+ * asset names match {@link BUILDS}; when they drift (a rename, a release that
+ * never shipped an asset) GitHub answers with a 404 page. Pointing the buttons
+ * at the repo itself keeps them correct no matter what the latest release
+ * happens to contain.
+ */
+export const REPO_URL = `https://github.com/${REPO}`;
+
 /** Fallback version shown before the GitHub API responds (keep in sync with dictate/__init__.py). */
 export const FALLBACK_VERSION = "1.0.1";
 
