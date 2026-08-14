@@ -24,14 +24,14 @@ from AppKit import (
     NSApplicationActivationPolicyAccessory,
     NSAlert,
     NSBackingStoreBuffered,
-    NSBezelStyleRounded,
     NSBezierPath,
     NSBox,
     NSBoxSeparator,
     NSButton,
     NSColor,
-    NSControlSizeSmall,
     NSFont,
+    NSFontAttributeName,
+    NSForegroundColorAttributeName,
     NSFontWeightRegular,
     NSFontWeightSemibold,
     NSGlassEffectView,
@@ -53,6 +53,7 @@ from AppKit import (
     NSWorkspace,
 )
 from Foundation import (
+    NSAttributedString,
     NSMakePoint,
     NSMakeRect,
     NSMakeSize,
@@ -231,6 +232,40 @@ _PANEL_MENU_GAP = 7  # drop below the menu bar, level with a MenuBarExtra window
 _PANEL_REOPEN_GUARD = 0.25
 
 
+_BUTTON_H = 25
+_BUTTON_RADIUS = 6.0
+_BUTTON_FILL_ALPHA = 0.08
+_BUTTON_PAD_X = 11  # per side; nets 13pt to the glyph, measured off Intermission's buttons
+
+
+class _ButtonRow(NSView):
+    """Paints SwiftUI's bordered-button fill behind a borderless button.
+
+    AppKit's rounded bezel is a white pill with an outline and a drop shadow;
+    SwiftUI's is a flat rounded rect of the label colour at 8% alpha (measured
+    off Intermission's panel), and that is what reads as a solid rectangle
+    against the glass. Painting it here rather than as a layer colour keeps
+    light/dark correct, since the dynamic colour resolves at draw time.
+
+    The fill lives on this wrapper instead of on the button because NSButton
+    pins its image to the leading edge whatever the alignment, so padding the
+    button's own frame leaves the icon flush against the fill. Insetting the
+    button inside a wrapper is the only way to get SwiftUI's even padding.
+    """
+
+    def drawRect_(self, rect):  # noqa: N802
+        NSColor.labelColor().colorWithAlphaComponent_(_BUTTON_FILL_ALPHA).setFill()
+        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            self.bounds(), _BUTTON_RADIUS, _BUTTON_RADIUS
+        ).fill()
+
+    def mouseDown_(self, event):  # noqa: N802
+        """Keep the whole pill clickable, not just the inset button."""
+        subviews = self.subviews()
+        if subviews:
+            subviews[0].performClick_(None)
+
+
 class _GlassPanel(NSPanel):
     """A borderless panel that can still take key focus.
 
@@ -366,25 +401,44 @@ class DictationController(NSObject):
 
     @objc.python_method
     def _button(self, title, symbol, action):
-        """A bordered push button sized to its label, with a leading SF Symbol.
+        """A filled rounded rect sized to its label, with a leading SF Symbol.
 
-        That bezel is what SwiftUI's plain ``Button`` renders as inside a menu
-        panel, and it is what gives the solid-rectangle look on the glass.
+        Returns the wrapper that paints the fill, with the button inset inside
+        it — see _ButtonRow for why the fill can't live on the button itself.
         """
         button = NSButton.buttonWithTitle_target_action_(title, self, action)
-        button.setBezelStyle_(NSBezelStyleRounded)
-        # Small control size, then the 13pt text back on top: the small bezel is
-        # 27pt tall against SwiftUI's 25pt, where the regular one would be 32pt
-        # and make the panel noticeably chunkier. Forcing the frame shorter than
-        # the bezel's natural height instead just clips it.
-        button.setControlSize_(NSControlSizeSmall)
-        button.setFont_(NSFont.systemFontOfSize_weight_(13, NSFontWeightRegular))
+        button.setBordered_(False)  # the fill is drawn by _ButtonRow
+        font = NSFont.systemFontOfSize_weight_(13, NSFontWeightRegular)
+        button.setFont_(font)
+        # A borderless button dims its own title and icon; SwiftUI's sit at full
+        # label colour. Spell both out so they match.
+        button.setAttributedTitle_(
+            NSAttributedString.alloc().initWithString_attributes_(
+                title,
+                {
+                    NSForegroundColorAttributeName: NSColor.labelColor(),
+                    NSFontAttributeName: font,
+                },
+            )
+        )
         image = _symbol_image(symbol, point_size=13.0)
         if image is not None:
             button.setImage_(image)
             button.setImagePosition_(NSImageLeft)
+            button.setContentTintColor_(NSColor.labelColor())
+        # Hug the label, then centre it in a fill padded to SwiftUI's proportions.
         button.sizeToFit()
-        return button
+        size = button.frame().size
+        row = _ButtonRow.alloc().initWithFrame_(
+            NSMakeRect(0, 0, size.width + (_BUTTON_PAD_X * 2), _BUTTON_H)
+        )
+        button.setFrame_(
+            NSMakeRect(
+                _BUTTON_PAD_X, (_BUTTON_H - size.height) / 2.0, size.width, size.height
+            )
+        )
+        row.addSubview_(button)
+        return row
 
     @objc.python_method
     def _divider(self):
