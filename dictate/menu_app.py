@@ -468,7 +468,9 @@ class DictationController(NSObject):
         item = window.convertRectToScreen_(button.convertRect_toView_(button.bounds(), None))
         size = self.panel.frame().size
 
-        x = item.origin.x + (item.size.width - _PANEL_WIDTH) / 2.0
+        # Left edge under the item's left edge, the way a MenuBarExtra window
+        # hangs — not centred on the item.
+        x = item.origin.x
         y = item.origin.y - size.height - _PANEL_MENU_GAP
         visible = (window.screen() or NSScreen.mainScreen()).visibleFrame()
         # Keep it fully on screen when the item sits near a corner.
