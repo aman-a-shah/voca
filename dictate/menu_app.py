@@ -23,6 +23,7 @@ from AppKit import (
     NSApplication,
     NSApplicationActivationPolicyAccessory,
     NSAlert,
+    NSBackingStoreBuffered,
     NSBezelStyleRounded,
     NSBezierPath,
     NSBox,
@@ -33,21 +34,31 @@ from AppKit import (
     NSFont,
     NSFontWeightRegular,
     NSFontWeightSemibold,
+    NSGlassEffectView,
     NSImage,
     NSImageLeft,
     NSImageSymbolConfiguration,
     NSLineBreakByTruncatingTail,
-    NSPopover,
-    NSPopoverBehaviorTransient,
+    NSPanel,
+    NSPopUpMenuWindowLevel,
+    NSScreen,
     NSStatusBar,
     NSTextAlignmentLeft,
     NSTextField,
     NSView,
-    NSViewController,
     NSVariableStatusItemLength,
+    NSWindowCollectionBehaviorCanJoinAllSpaces,
+    NSWindowCollectionBehaviorTransient,
+    NSWindowStyleMaskBorderless,
     NSWorkspace,
 )
-from Foundation import NSMakeRect, NSMakeSize, NSObject, NSRunLoopCommonModes
+from Foundation import (
+    NSMakePoint,
+    NSMakeRect,
+    NSMakeSize,
+    NSObject,
+    NSRunLoopCommonModes,
+)
 
 from .config import CONFIG
 from .core import DictationEngine
@@ -212,6 +223,25 @@ _PANEL_GAP = 12
 _HEADER_GAP = 3
 _TITLE_H = 16  # one line of 13pt semibold
 _CAPTION_H = 15  # one line of 12pt regular
+_PANEL_CORNER = 14  # glass corner radius, as a MenuBarExtra window draws it
+_PANEL_MENU_GAP = 7  # drop below the menu bar, level with a MenuBarExtra window
+# Clicking the status item while the panel is open makes it resign key, which
+# closes it — and the click would then immediately reopen it. Ignore a reopen
+# that lands within this window so the item toggles instead of flickering.
+_PANEL_REOPEN_GUARD = 0.25
+
+
+class _GlassPanel(NSPanel):
+    """A borderless panel that can still take key focus.
+
+    Borderless windows refuse key by default, and without key focus there is no
+    resign-key notification — which is the only dismissal a panel gets, since
+    unlike NSPopover it has no light-dismiss of its own. A global mouse monitor
+    would need Accessibility trust and still miss synthetic clicks.
+    """
+
+    def canBecomeKeyWindow(self):  # noqa: N802
+        return True
 
 
 class DictationController(NSObject):
@@ -224,7 +254,8 @@ class DictationController(NSObject):
         self.stateItem = None
         self.lastItem = None
         self.modelItem = None
-        self.popover = None
+        self.panel = None
+        self._panel_closed_at = 0.0
         self.hotkey = None
         self.overlay = None
         self._pending = []  # (state, info) queued from worker threads
@@ -243,7 +274,7 @@ class DictationController(NSObject):
             button.setAction_("toggleMenu:")
             button.setToolTip_("Voca")
 
-        self._build_popover()
+        self._build_panel()
 
         # Heads-up voice overlay that drops from the camera notch while you hold fn.
         self.overlay = Overlay.alloc().initWithLevelProvider_(
@@ -252,7 +283,7 @@ class DictationController(NSObject):
         self.overlay.build()
 
     @objc.python_method
-    def _build_popover(self):
+    def _build_panel(self):
         """The menu-bar panel — a translucent popover matching Intermission's.
 
         Rows are declared top-down as (view, width, height, gap-above); the gap
@@ -296,13 +327,33 @@ class DictationController(NSObject):
             child.setFrame_(NSMakeRect(_PANEL_PAD, top, w, h))
             view.addSubview_(child)
 
-        controller = NSViewController.alloc().init()
-        controller.setView_(view)
+        # A borderless panel filled with glass, rather than an NSPopover: only
+        # this gets the same Liquid Glass material and square-cornered, arrowless
+        # shape as a SwiftUI MenuBarExtra window. A popover draws the older
+        # arrowed chrome and anchors itself over the menu bar.
+        glass = NSGlassEffectView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, _PANEL_WIDTH, height)
+        )
+        glass.setCornerRadius_(_PANEL_CORNER)
+        glass.setContentView_(view)
 
-        self.popover = NSPopover.alloc().init()
-        self.popover.setBehavior_(NSPopoverBehaviorTransient)
-        self.popover.setContentSize_(NSMakeSize(_PANEL_WIDTH, height))
-        self.popover.setContentViewController_(controller)
+        self.panel = _GlassPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(0, 0, _PANEL_WIDTH, height),
+            NSWindowStyleMaskBorderless,
+            NSBackingStoreBuffered,
+            False,
+        )
+        self.panel.setContentView_(glass)
+        self.panel.setDelegate_(self)  # for windowDidResignKey_
+        self.panel.setOpaque_(False)  # let the glass show what's behind it
+        self.panel.setBackgroundColor_(NSColor.clearColor())
+        self.panel.setHasShadow_(True)
+        self.panel.setLevel_(NSPopUpMenuWindowLevel)  # above ordinary windows
+        self.panel.setHidesOnDeactivate_(False)
+        self.panel.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorTransient
+        )
 
     @objc.python_method
     def _label(self, title, size, weight, secondary=False):
@@ -342,23 +393,46 @@ class DictationController(NSObject):
         return divider
 
     def toggleMenu_(self, _):  # noqa: N802
-        if self.popover is None or self.statusItem is None:
+        if self.panel is None or self.statusItem is None:
             return
-        button = self.statusItem.button()
-        if button is None:
-            return
-        if self.popover.isShown():
-            self.popover.performClose_(None)
-        else:
-            self.popover.showRelativeToRect_ofView_preferredEdge_(
-                button.bounds(), button, 1
-            )
-            NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        if self.panel.isVisible():
+            self._close_panel()
+        elif time.monotonic() - self._panel_closed_at >= _PANEL_REOPEN_GUARD:
+            self._open_panel()
+
+    def windowDidResignKey_(self, _notification):  # noqa: N802
+        """Clicking anywhere else takes key away — that's our light-dismiss."""
+        self._close_panel()
 
     @objc.python_method
-    def _close_popover(self):
-        if self.popover is not None and self.popover.isShown():
-            self.popover.performClose_(None)
+    def _open_panel(self):
+        """Hang the panel under the menu-bar item, clamped to the screen."""
+        button = self.statusItem.button()
+        window = button.window() if button is not None else None
+        if window is None:
+            return
+        item = window.convertRectToScreen_(button.convertRect_toView_(button.bounds(), None))
+        size = self.panel.frame().size
+
+        x = item.origin.x + (item.size.width - _PANEL_WIDTH) / 2.0
+        y = item.origin.y - size.height - _PANEL_MENU_GAP
+        visible = (window.screen() or NSScreen.mainScreen()).visibleFrame()
+        # Keep it fully on screen when the item sits near a corner.
+        x = max(
+            visible.origin.x + 8,
+            min(x, visible.origin.x + visible.size.width - _PANEL_WIDTH - 8),
+        )
+        self.panel.setFrameOrigin_(NSMakePoint(x, y))
+        # Taking key focus is what arms the resign-key dismissal below; an
+        # accessory app has to activate itself to get it.
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        self.panel.makeKeyAndOrderFront_(None)
+
+    @objc.python_method
+    def _close_panel(self):
+        if self.panel is not None and self.panel.isVisible():
+            self.panel.orderOut_(None)
+        self._panel_closed_at = time.monotonic()
 
     # -- app delegate: fires once the app is fully launched & able to show UI -
     def applicationDidFinishLaunching_(self, _notification):  # noqa: N802
@@ -541,11 +615,11 @@ class DictationController(NSObject):
     def openDashboard_(self, _):  # noqa: N802
         from .launch import open_dashboard
 
-        self._close_popover()
+        self._close_panel()
         open_dashboard()
 
     def quitApp_(self, _):  # noqa: N802
-        self._close_popover()
+        self._close_panel()
         self._terminate()
 
     def applicationWillTerminate_(self, _notification):  # noqa: N802
