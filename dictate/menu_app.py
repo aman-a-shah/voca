@@ -23,14 +23,27 @@ from AppKit import (
     NSApplication,
     NSApplicationActivationPolicyAccessory,
     NSAlert,
+    NSBezelStyleRounded,
     NSBezierPath,
+    NSBox,
+    NSBoxSeparator,
+    NSButton,
     NSColor,
+    NSControlSizeSmall,
+    NSFont,
     NSFontWeightRegular,
+    NSFontWeightSemibold,
     NSImage,
+    NSImageLeft,
     NSImageSymbolConfiguration,
-    NSMenu,
-    NSMenuItem,
+    NSLineBreakByTruncatingTail,
+    NSPopover,
+    NSPopoverBehaviorTransient,
     NSStatusBar,
+    NSTextAlignmentLeft,
+    NSTextField,
+    NSView,
+    NSViewController,
     NSVariableStatusItemLength,
     NSWorkspace,
 )
@@ -162,28 +175,43 @@ def _waveform_image():
     return image
 
 
-def _symbol_image(name):
-    """A template NSImage for the menu bar (cached), or None if unavailable.
+def _symbol_image(name, point_size=15.0):
+    """A template NSImage (cached), or None if unavailable.
 
     ``ld.waveform`` is our own drawn 4-bar mark; everything else is an SF Symbol.
+    The menu-bar glyph wants 15pt; button labels want to match their 13pt text,
+    so the size is part of the cache key.
     """
     if name == "ld.waveform":
         return _waveform_image()
-    if name in _SYMBOL_CACHE:
-        return _SYMBOL_CACHE[name]
+    key = (name, point_size)
+    if key in _SYMBOL_CACHE:
+        return _SYMBOL_CACHE[key]
     image = None
     try:
         image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, None)
         if image is not None:
             cfg = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
-                15.0, NSFontWeightRegular
+                point_size, NSFontWeightRegular
             )
             image = image.imageWithSymbolConfiguration_(cfg) or image
-            image.setTemplate_(True)  # let the menu bar tint it (light/dark)
+            image.setTemplate_(True)  # let the host tint it (light/dark)
     except Exception:
         image = None
-    _SYMBOL_CACHE[name] = image
+    _SYMBOL_CACHE[key] = image
     return image
+
+
+# Panel metrics lifted from Intermission's SwiftUI menu, so our three menu-bar
+# apps drop the same translucent panel: 244pt wide, 12pt padding, 12pt between
+# blocks, 3pt between the two header lines. AppKit has no VStack, so the rows
+# below are laid out by hand against these numbers.
+_PANEL_WIDTH = 244
+_PANEL_PAD = 12
+_PANEL_GAP = 12
+_HEADER_GAP = 3
+_TITLE_H = 16  # one line of 13pt semibold
+_CAPTION_H = 15  # one line of 12pt regular
 
 
 class DictationController(NSObject):
@@ -195,6 +223,8 @@ class DictationController(NSObject):
         self.statusItem = None
         self.stateItem = None
         self.lastItem = None
+        self.modelItem = None
+        self.popover = None
         self.hotkey = None
         self.overlay = None
         self._pending = []  # (state, info) queued from worker threads
@@ -207,29 +237,13 @@ class DictationController(NSObject):
         bar = NSStatusBar.systemStatusBar()
         self.statusItem = bar.statusItemWithLength_(NSVariableStatusItemLength)
         self._glyph("loading")
+        button = self.statusItem.button()
+        if button is not None:
+            button.setTarget_(self)
+            button.setAction_("toggleMenu:")
+            button.setToolTip_("Voca")
 
-        menu = NSMenu.alloc().init()
-
-        self.stateItem = self._item("Loading model…", None)
-        menu.addItem_(self.stateItem)
-        self.lastItem = self._item("Last: —", None)
-        menu.addItem_(self.lastItem)
-        menu.addItem_(NSMenuItem.separatorItem())
-
-        dashboard_item = self._item("Open Dashboard…", "openDashboard:")
-        dashboard_item.setKeyEquivalent_("d")
-        menu.addItem_(dashboard_item)
-        menu.addItem_(NSMenuItem.separatorItem())
-
-        hint = self._item(f"Model: {CONFIG.model.split('/')[-1]}", None)
-        menu.addItem_(hint)
-        menu.addItem_(NSMenuItem.separatorItem())
-
-        quit_item = self._item("Quit Voca", "quitApp:")
-        quit_item.setKeyEquivalent_("q")
-        menu.addItem_(quit_item)
-
-        self.statusItem.setMenu_(menu)
+        self._build_popover()
 
         # Heads-up voice overlay that drops from the camera notch while you hold fn.
         self.overlay = Overlay.alloc().initWithLevelProvider_(
@@ -238,13 +252,113 @@ class DictationController(NSObject):
         self.overlay.build()
 
     @objc.python_method
-    def _item(self, title, action):
-        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, "")
-        if action is None:
-            item.setEnabled_(False)
+    def _build_popover(self):
+        """The menu-bar panel — a translucent popover matching Intermission's.
+
+        Rows are declared top-down as (view, width, height, gap-above); the gap
+        on the first row is the top padding. Their total plus one bottom padding
+        is the panel height, which then flips each row's top offset into
+        AppKit's bottom-left origin.
+        """
+        inner = _PANEL_WIDTH - (_PANEL_PAD * 2)
+
+        self.stateItem = self._label("Voca is warming up", 13, NSFontWeightSemibold)
+        self.lastItem = self._label("Last: —", 12, NSFontWeightRegular, secondary=True)
+        self.lastItem.cell().setLineBreakMode_(NSLineBreakByTruncatingTail)
+        self.modelItem = self._label(
+            f"Model: {CONFIG.model.split('/')[-1]}", 12, NSFontWeightRegular, secondary=True
+        )
+        dashboard = self._button("Open Dashboard…", "rectangle.grid.2x2", "openDashboard:")
+        quit_button = self._button("Quit Voca", "power", "quitApp:")
+
+        def button_row(button, gap):
+            # Buttons keep the size they hugged their label to, so they read as
+            # discrete pills like SwiftUI's rather than full-width bars.
+            size = button.frame().size
+            return (button, size.width, size.height, gap)
+
+        rows = [
+            (self.stateItem, inner, _TITLE_H, _PANEL_PAD),
+            (self.lastItem, inner, _CAPTION_H, _HEADER_GAP),
+            (self._divider(), inner, 1, _PANEL_GAP),
+            button_row(dashboard, _PANEL_GAP),
+            (self._divider(), inner, 1, _PANEL_GAP),
+            (self.modelItem, inner, _CAPTION_H, _PANEL_GAP),
+            button_row(quit_button, _PANEL_GAP),
+        ]
+
+        height = sum(h + gap for _, _, h, gap in rows) + _PANEL_PAD
+        view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, _PANEL_WIDTH, height))
+
+        top = height
+        for child, w, h, gap in rows:
+            top -= gap + h
+            child.setFrame_(NSMakeRect(_PANEL_PAD, top, w, h))
+            view.addSubview_(child)
+
+        controller = NSViewController.alloc().init()
+        controller.setView_(view)
+
+        self.popover = NSPopover.alloc().init()
+        self.popover.setBehavior_(NSPopoverBehaviorTransient)
+        self.popover.setContentSize_(NSMakeSize(_PANEL_WIDTH, height))
+        self.popover.setContentViewController_(controller)
+
+    @objc.python_method
+    def _label(self, title, size, weight, secondary=False):
+        label = NSTextField.labelWithString_(title)
+        label.setFont_(NSFont.systemFontOfSize_weight_(size, weight))
+        label.setAlignment_(NSTextAlignmentLeft)
+        if secondary:
+            label.setTextColor_(NSColor.secondaryLabelColor())
+        return label
+
+    @objc.python_method
+    def _button(self, title, symbol, action):
+        """A bordered push button sized to its label, with a leading SF Symbol.
+
+        That bezel is what SwiftUI's plain ``Button`` renders as inside a menu
+        panel, and it is what gives the solid-rectangle look on the glass.
+        """
+        button = NSButton.buttonWithTitle_target_action_(title, self, action)
+        button.setBezelStyle_(NSBezelStyleRounded)
+        # Small control size, then the 13pt text back on top: the small bezel is
+        # 27pt tall against SwiftUI's 25pt, where the regular one would be 32pt
+        # and make the panel noticeably chunkier. Forcing the frame shorter than
+        # the bezel's natural height instead just clips it.
+        button.setControlSize_(NSControlSizeSmall)
+        button.setFont_(NSFont.systemFontOfSize_weight_(13, NSFontWeightRegular))
+        image = _symbol_image(symbol, point_size=13.0)
+        if image is not None:
+            button.setImage_(image)
+            button.setImagePosition_(NSImageLeft)
+        button.sizeToFit()
+        return button
+
+    @objc.python_method
+    def _divider(self):
+        divider = NSBox.alloc().init()
+        divider.setBoxType_(NSBoxSeparator)
+        return divider
+
+    def toggleMenu_(self, _):  # noqa: N802
+        if self.popover is None or self.statusItem is None:
+            return
+        button = self.statusItem.button()
+        if button is None:
+            return
+        if self.popover.isShown():
+            self.popover.performClose_(None)
         else:
-            item.setTarget_(self)
-        return item
+            self.popover.showRelativeToRect_ofView_preferredEdge_(
+                button.bounds(), button, 1
+            )
+            NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+
+    @objc.python_method
+    def _close_popover(self):
+        if self.popover is not None and self.popover.isShown():
+            self.popover.performClose_(None)
 
     # -- app delegate: fires once the app is fully launched & able to show UI -
     def applicationDidFinishLaunching_(self, _notification):  # noqa: N802
@@ -378,7 +492,7 @@ class DictationController(NSObject):
         elif state == "result":
             text = str(g("text", ""))
             elapsed = float(g("elapsed", 0))
-            self.lastItem.setTitle_(f"Last: “{_truncate(text)}”  ({elapsed:0.1f}s)")
+            self.lastItem.setStringValue_(f"Last: “{_truncate(text)}”  ({elapsed:0.1f}s)")
             self._show_state("ready", "Inserted ✓")
             if self.overlay is not None:
                 self.overlay.set_mode("done")  # brief green confirm before it retracts
@@ -395,7 +509,7 @@ class DictationController(NSObject):
     def _show_state(self, glyph_key, message):
         self._glyph(glyph_key)
         if self.stateItem is not None:
-            self.stateItem.setTitle_(message)
+            self.stateItem.setStringValue_(message)
 
     @objc.python_method
     def _glyph(self, glyph_key):
@@ -427,9 +541,11 @@ class DictationController(NSObject):
     def openDashboard_(self, _):  # noqa: N802
         from .launch import open_dashboard
 
+        self._close_popover()
         open_dashboard()
 
     def quitApp_(self, _):  # noqa: N802
+        self._close_popover()
         self._terminate()
 
     def applicationWillTerminate_(self, _notification):  # noqa: N802
