@@ -34,7 +34,6 @@ from AppKit import (
     NSForegroundColorAttributeName,
     NSFontWeightRegular,
     NSFontWeightSemibold,
-    NSGlassEffectView,
     NSImage,
     NSImageLeft,
     NSImageSymbolConfiguration,
@@ -47,6 +46,10 @@ from AppKit import (
     NSTextField,
     NSView,
     NSVariableStatusItemLength,
+    NSVisualEffectView,
+    NSVisualEffectBlendingModeBehindWindow,
+    NSVisualEffectMaterialPopover,
+    NSVisualEffectStateActive,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorTransient,
     NSWindowStyleMaskBorderless,
@@ -60,6 +63,11 @@ from Foundation import (
     NSObject,
     NSRunLoopCommonModes,
 )
+
+try:
+    from AppKit import NSGlassEffectView
+except ImportError:  # Liquid Glass is available only on macOS 26+.
+    NSGlassEffectView = None
 
 from .config import CONFIG
 from .core import DictationEngine
@@ -366,11 +374,20 @@ class DictationController(NSObject):
         # this gets the same Liquid Glass material and square-cornered, arrowless
         # shape as a SwiftUI MenuBarExtra window. A popover draws the older
         # arrowed chrome and anchors itself over the menu bar.
-        glass = NSGlassEffectView.alloc().initWithFrame_(
-            NSMakeRect(0, 0, _PANEL_WIDTH, height)
-        )
-        glass.setCornerRadius_(_PANEL_CORNER)
-        glass.setContentView_(view)
+        frame = NSMakeRect(0, 0, _PANEL_WIDTH, height)
+        if NSGlassEffectView is not None:
+            glass = NSGlassEffectView.alloc().initWithFrame_(frame)
+            glass.setCornerRadius_(_PANEL_CORNER)
+            glass.setContentView_(view)
+        else:
+            glass = NSVisualEffectView.alloc().initWithFrame_(frame)
+            glass.setMaterial_(NSVisualEffectMaterialPopover)
+            glass.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
+            glass.setState_(NSVisualEffectStateActive)
+            glass.setWantsLayer_(True)
+            glass.layer().setCornerRadius_(_PANEL_CORNER)
+            glass.layer().setMasksToBounds_(True)
+            glass.addSubview_(view)
 
         self.panel = _GlassPanel.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(0, 0, _PANEL_WIDTH, height),
