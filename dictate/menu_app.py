@@ -23,18 +23,51 @@ from AppKit import (
     NSApplication,
     NSApplicationActivationPolicyAccessory,
     NSAlert,
+    NSBackingStoreBuffered,
     NSBezierPath,
+    NSBox,
+    NSBoxSeparator,
+    NSButton,
     NSColor,
+    NSFont,
+    NSFontAttributeName,
+    NSForegroundColorAttributeName,
     NSFontWeightRegular,
+    NSFontWeightSemibold,
     NSImage,
+    NSImageLeft,
     NSImageSymbolConfiguration,
-    NSMenu,
-    NSMenuItem,
+    NSLineBreakByTruncatingTail,
+    NSPanel,
+    NSPopUpMenuWindowLevel,
+    NSScreen,
     NSStatusBar,
+    NSTextAlignmentLeft,
+    NSTextField,
+    NSView,
     NSVariableStatusItemLength,
+    NSVisualEffectView,
+    NSVisualEffectBlendingModeBehindWindow,
+    NSVisualEffectMaterialPopover,
+    NSVisualEffectStateActive,
+    NSWindowCollectionBehaviorCanJoinAllSpaces,
+    NSWindowCollectionBehaviorTransient,
+    NSWindowStyleMaskBorderless,
     NSWorkspace,
 )
-from Foundation import NSMakeRect, NSMakeSize, NSObject, NSRunLoopCommonModes
+from Foundation import (
+    NSAttributedString,
+    NSMakePoint,
+    NSMakeRect,
+    NSMakeSize,
+    NSObject,
+    NSRunLoopCommonModes,
+)
+
+try:
+    from AppKit import NSGlassEffectView
+except ImportError:  # Liquid Glass is available only on macOS 26+.
+    NSGlassEffectView = None
 
 from .config import CONFIG
 from .core import DictationEngine
@@ -162,28 +195,96 @@ def _waveform_image():
     return image
 
 
-def _symbol_image(name):
-    """A template NSImage for the menu bar (cached), or None if unavailable.
+def _symbol_image(name, point_size=15.0):
+    """A template NSImage (cached), or None if unavailable.
 
     ``ld.waveform`` is our own drawn 4-bar mark; everything else is an SF Symbol.
+    The menu-bar glyph wants 15pt; button labels want to match their 13pt text,
+    so the size is part of the cache key.
     """
     if name == "ld.waveform":
         return _waveform_image()
-    if name in _SYMBOL_CACHE:
-        return _SYMBOL_CACHE[name]
+    key = (name, point_size)
+    if key in _SYMBOL_CACHE:
+        return _SYMBOL_CACHE[key]
     image = None
     try:
         image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, None)
         if image is not None:
             cfg = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
-                15.0, NSFontWeightRegular
+                point_size, NSFontWeightRegular
             )
             image = image.imageWithSymbolConfiguration_(cfg) or image
-            image.setTemplate_(True)  # let the menu bar tint it (light/dark)
+            image.setTemplate_(True)  # let the host tint it (light/dark)
     except Exception:
         image = None
-    _SYMBOL_CACHE[name] = image
+    _SYMBOL_CACHE[key] = image
     return image
+
+
+# Panel metrics lifted from Intermission's SwiftUI menu, so our three menu-bar
+# apps drop the same translucent panel: 244pt wide, 12pt padding, 12pt between
+# blocks, 3pt between the two header lines. AppKit has no VStack, so the rows
+# below are laid out by hand against these numbers.
+_PANEL_WIDTH = 244
+_PANEL_PAD = 12
+_PANEL_GAP = 12
+_HEADER_GAP = 3
+_TITLE_H = 16  # one line of 13pt semibold
+_CAPTION_H = 15  # one line of 12pt regular
+_PANEL_CORNER = 14  # glass corner radius, as a MenuBarExtra window draws it
+_PANEL_MENU_GAP = 7  # drop below the menu bar, level with a MenuBarExtra window
+# Clicking the status item while the panel is open makes it resign key, which
+# closes it — and the click would then immediately reopen it. Ignore a reopen
+# that lands within this window so the item toggles instead of flickering.
+_PANEL_REOPEN_GUARD = 0.25
+
+
+_BUTTON_H = 25
+_BUTTON_RADIUS = 6.0
+_BUTTON_FILL_ALPHA = 0.08
+_BUTTON_PAD_X = 11  # per side; nets 13pt to the glyph, measured off Intermission's buttons
+
+
+class _ButtonRow(NSView):
+    """Paints SwiftUI's bordered-button fill behind a borderless button.
+
+    AppKit's rounded bezel is a white pill with an outline and a drop shadow;
+    SwiftUI's is a flat rounded rect of the label colour at 8% alpha (measured
+    off Intermission's panel), and that is what reads as a solid rectangle
+    against the glass. Painting it here rather than as a layer colour keeps
+    light/dark correct, since the dynamic colour resolves at draw time.
+
+    The fill lives on this wrapper instead of on the button because NSButton
+    pins its image to the leading edge whatever the alignment, so padding the
+    button's own frame leaves the icon flush against the fill. Insetting the
+    button inside a wrapper is the only way to get SwiftUI's even padding.
+    """
+
+    def drawRect_(self, rect):  # noqa: N802
+        NSColor.labelColor().colorWithAlphaComponent_(_BUTTON_FILL_ALPHA).setFill()
+        NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            self.bounds(), _BUTTON_RADIUS, _BUTTON_RADIUS
+        ).fill()
+
+    def mouseDown_(self, event):  # noqa: N802
+        """Keep the whole pill clickable, not just the inset button."""
+        subviews = self.subviews()
+        if subviews:
+            subviews[0].performClick_(None)
+
+
+class _GlassPanel(NSPanel):
+    """A borderless panel that can still take key focus.
+
+    Borderless windows refuse key by default, and without key focus there is no
+    resign-key notification — which is the only dismissal a panel gets, since
+    unlike NSPopover it has no light-dismiss of its own. A global mouse monitor
+    would need Accessibility trust and still miss synthetic clicks.
+    """
+
+    def canBecomeKeyWindow(self):  # noqa: N802
+        return True
 
 
 class DictationController(NSObject):
@@ -195,6 +296,9 @@ class DictationController(NSObject):
         self.statusItem = None
         self.stateItem = None
         self.lastItem = None
+        self.modelItem = None
+        self.panel = None
+        self._panel_closed_at = 0.0
         self.hotkey = None
         self.overlay = None
         self._pending = []  # (state, info) queued from worker threads
@@ -207,29 +311,13 @@ class DictationController(NSObject):
         bar = NSStatusBar.systemStatusBar()
         self.statusItem = bar.statusItemWithLength_(NSVariableStatusItemLength)
         self._glyph("loading")
+        button = self.statusItem.button()
+        if button is not None:
+            button.setTarget_(self)
+            button.setAction_("toggleMenu:")
+            button.setToolTip_("Voca")
 
-        menu = NSMenu.alloc().init()
-
-        self.stateItem = self._item("Loading model…", None)
-        menu.addItem_(self.stateItem)
-        self.lastItem = self._item("Last: —", None)
-        menu.addItem_(self.lastItem)
-        menu.addItem_(NSMenuItem.separatorItem())
-
-        dashboard_item = self._item("Open Dashboard…", "openDashboard:")
-        dashboard_item.setKeyEquivalent_("d")
-        menu.addItem_(dashboard_item)
-        menu.addItem_(NSMenuItem.separatorItem())
-
-        hint = self._item(f"Model: {CONFIG.model.split('/')[-1]}", None)
-        menu.addItem_(hint)
-        menu.addItem_(NSMenuItem.separatorItem())
-
-        quit_item = self._item("Quit Voca", "quitApp:")
-        quit_item.setKeyEquivalent_("q")
-        menu.addItem_(quit_item)
-
-        self.statusItem.setMenu_(menu)
+        self._build_panel()
 
         # Heads-up voice overlay that drops from the camera notch while you hold fn.
         self.overlay = Overlay.alloc().initWithLevelProvider_(
@@ -238,13 +326,186 @@ class DictationController(NSObject):
         self.overlay.build()
 
     @objc.python_method
-    def _item(self, title, action):
-        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, "")
-        if action is None:
-            item.setEnabled_(False)
+    def _build_panel(self):
+        """The menu-bar panel — a translucent popover matching Intermission's.
+
+        Rows are declared top-down as (view, width, height, gap-above); the gap
+        on the first row is the top padding. Their total plus one bottom padding
+        is the panel height, which then flips each row's top offset into
+        AppKit's bottom-left origin.
+        """
+        inner = _PANEL_WIDTH - (_PANEL_PAD * 2)
+
+        self.stateItem = self._label("Voca is warming up", 13, NSFontWeightSemibold)
+        self.lastItem = self._label("Last: —", 12, NSFontWeightRegular, secondary=True)
+        self.lastItem.cell().setLineBreakMode_(NSLineBreakByTruncatingTail)
+        self.modelItem = self._label(
+            f"Model: {CONFIG.model.split('/')[-1]}", 12, NSFontWeightRegular, secondary=True
+        )
+        dashboard = self._button("Open Dashboard…", "rectangle.grid.2x2", "openDashboard:")
+        quit_button = self._button("Quit Voca", "power", "quitApp:")
+
+        def button_row(button, gap):
+            # Buttons keep the size they hugged their label to, so they read as
+            # discrete pills like SwiftUI's rather than full-width bars.
+            size = button.frame().size
+            return (button, size.width, size.height, gap)
+
+        rows = [
+            (self.stateItem, inner, _TITLE_H, _PANEL_PAD),
+            (self.lastItem, inner, _CAPTION_H, _HEADER_GAP),
+            (self._divider(), inner, 1, _PANEL_GAP),
+            button_row(dashboard, _PANEL_GAP),
+            (self._divider(), inner, 1, _PANEL_GAP),
+            (self.modelItem, inner, _CAPTION_H, _PANEL_GAP),
+            button_row(quit_button, _PANEL_GAP),
+        ]
+
+        height = sum(h + gap for _, _, h, gap in rows) + _PANEL_PAD
+        view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, _PANEL_WIDTH, height))
+
+        top = height
+        for child, w, h, gap in rows:
+            top -= gap + h
+            child.setFrame_(NSMakeRect(_PANEL_PAD, top, w, h))
+            view.addSubview_(child)
+
+        # A borderless panel filled with glass, rather than an NSPopover: only
+        # this gets the same Liquid Glass material and square-cornered, arrowless
+        # shape as a SwiftUI MenuBarExtra window. A popover draws the older
+        # arrowed chrome and anchors itself over the menu bar.
+        frame = NSMakeRect(0, 0, _PANEL_WIDTH, height)
+        if NSGlassEffectView is not None:
+            glass = NSGlassEffectView.alloc().initWithFrame_(frame)
+            glass.setCornerRadius_(_PANEL_CORNER)
+            glass.setContentView_(view)
         else:
-            item.setTarget_(self)
-        return item
+            glass = NSVisualEffectView.alloc().initWithFrame_(frame)
+            glass.setMaterial_(NSVisualEffectMaterialPopover)
+            glass.setBlendingMode_(NSVisualEffectBlendingModeBehindWindow)
+            glass.setState_(NSVisualEffectStateActive)
+            glass.setWantsLayer_(True)
+            glass.layer().setCornerRadius_(_PANEL_CORNER)
+            glass.layer().setMasksToBounds_(True)
+            glass.addSubview_(view)
+
+        self.panel = _GlassPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(0, 0, _PANEL_WIDTH, height),
+            NSWindowStyleMaskBorderless,
+            NSBackingStoreBuffered,
+            False,
+        )
+        self.panel.setContentView_(glass)
+        self.panel.setDelegate_(self)  # for windowDidResignKey_
+        self.panel.setOpaque_(False)  # let the glass show what's behind it
+        self.panel.setBackgroundColor_(NSColor.clearColor())
+        self.panel.setHasShadow_(True)
+        self.panel.setLevel_(NSPopUpMenuWindowLevel)  # above ordinary windows
+        self.panel.setHidesOnDeactivate_(False)
+        self.panel.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorTransient
+        )
+
+    @objc.python_method
+    def _label(self, title, size, weight, secondary=False):
+        label = NSTextField.labelWithString_(title)
+        label.setFont_(NSFont.systemFontOfSize_weight_(size, weight))
+        label.setAlignment_(NSTextAlignmentLeft)
+        if secondary:
+            label.setTextColor_(NSColor.secondaryLabelColor())
+        return label
+
+    @objc.python_method
+    def _button(self, title, symbol, action):
+        """A filled rounded rect sized to its label, with a leading SF Symbol.
+
+        Returns the wrapper that paints the fill, with the button inset inside
+        it — see _ButtonRow for why the fill can't live on the button itself.
+        """
+        button = NSButton.buttonWithTitle_target_action_(title, self, action)
+        button.setBordered_(False)  # the fill is drawn by _ButtonRow
+        font = NSFont.systemFontOfSize_weight_(13, NSFontWeightRegular)
+        button.setFont_(font)
+        # A borderless button dims its own title and icon; SwiftUI's sit at full
+        # label colour. Spell both out so they match.
+        button.setAttributedTitle_(
+            NSAttributedString.alloc().initWithString_attributes_(
+                title,
+                {
+                    NSForegroundColorAttributeName: NSColor.labelColor(),
+                    NSFontAttributeName: font,
+                },
+            )
+        )
+        image = _symbol_image(symbol, point_size=13.0)
+        if image is not None:
+            button.setImage_(image)
+            button.setImagePosition_(NSImageLeft)
+            button.setContentTintColor_(NSColor.labelColor())
+        # Hug the label, then centre it in a fill padded to SwiftUI's proportions.
+        button.sizeToFit()
+        size = button.frame().size
+        row = _ButtonRow.alloc().initWithFrame_(
+            NSMakeRect(0, 0, size.width + (_BUTTON_PAD_X * 2), _BUTTON_H)
+        )
+        button.setFrame_(
+            NSMakeRect(
+                _BUTTON_PAD_X, (_BUTTON_H - size.height) / 2.0, size.width, size.height
+            )
+        )
+        row.addSubview_(button)
+        return row
+
+    @objc.python_method
+    def _divider(self):
+        divider = NSBox.alloc().init()
+        divider.setBoxType_(NSBoxSeparator)
+        return divider
+
+    def toggleMenu_(self, _):  # noqa: N802
+        if self.panel is None or self.statusItem is None:
+            return
+        if self.panel.isVisible():
+            self._close_panel()
+        elif time.monotonic() - self._panel_closed_at >= _PANEL_REOPEN_GUARD:
+            self._open_panel()
+
+    def windowDidResignKey_(self, _notification):  # noqa: N802
+        """Clicking anywhere else takes key away — that's our light-dismiss."""
+        self._close_panel()
+
+    @objc.python_method
+    def _open_panel(self):
+        """Hang the panel under the menu-bar item, clamped to the screen."""
+        button = self.statusItem.button()
+        window = button.window() if button is not None else None
+        if window is None:
+            return
+        item = window.convertRectToScreen_(button.convertRect_toView_(button.bounds(), None))
+        size = self.panel.frame().size
+
+        # Left edge under the item's left edge, the way a MenuBarExtra window
+        # hangs — not centred on the item.
+        x = item.origin.x
+        y = item.origin.y - size.height - _PANEL_MENU_GAP
+        visible = (window.screen() or NSScreen.mainScreen()).visibleFrame()
+        # Keep it fully on screen when the item sits near a corner.
+        x = max(
+            visible.origin.x + 8,
+            min(x, visible.origin.x + visible.size.width - _PANEL_WIDTH - 8),
+        )
+        self.panel.setFrameOrigin_(NSMakePoint(x, y))
+        # Taking key focus is what arms the resign-key dismissal below; an
+        # accessory app has to activate itself to get it.
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        self.panel.makeKeyAndOrderFront_(None)
+
+    @objc.python_method
+    def _close_panel(self):
+        if self.panel is not None and self.panel.isVisible():
+            self.panel.orderOut_(None)
+        self._panel_closed_at = time.monotonic()
 
     # -- app delegate: fires once the app is fully launched & able to show UI -
     def applicationDidFinishLaunching_(self, _notification):  # noqa: N802
@@ -378,7 +639,7 @@ class DictationController(NSObject):
         elif state == "result":
             text = str(g("text", ""))
             elapsed = float(g("elapsed", 0))
-            self.lastItem.setTitle_(f"Last: “{_truncate(text)}”  ({elapsed:0.1f}s)")
+            self.lastItem.setStringValue_(f"Last: “{_truncate(text)}”  ({elapsed:0.1f}s)")
             self._show_state("ready", "Inserted ✓")
             if self.overlay is not None:
                 self.overlay.set_mode("done")  # brief green confirm before it retracts
@@ -395,7 +656,7 @@ class DictationController(NSObject):
     def _show_state(self, glyph_key, message):
         self._glyph(glyph_key)
         if self.stateItem is not None:
-            self.stateItem.setTitle_(message)
+            self.stateItem.setStringValue_(message)
 
     @objc.python_method
     def _glyph(self, glyph_key):
@@ -427,9 +688,11 @@ class DictationController(NSObject):
     def openDashboard_(self, _):  # noqa: N802
         from .launch import open_dashboard
 
+        self._close_panel()
         open_dashboard()
 
     def quitApp_(self, _):  # noqa: N802
+        self._close_panel()
         self._terminate()
 
     def applicationWillTerminate_(self, _notification):  # noqa: N802
