@@ -2,8 +2,8 @@
 
 Distributable builds of **Voca** for macOS (Apple Silicon + Intel)
 and Windows. These produce the signed/unsigned installers a website can hand
-to users. (Local mac dev still uses the py2app alias build — `./build_app.sh` /
-`setup.py` — which is unchanged.)
+to users. (Local mac dev: `./build_app.sh` builds the dashboard + py2app alias
+app in one step.)
 
 ## Layout
 
@@ -19,11 +19,15 @@ to users. (Local mac dev still uses the py2app alias build — `./build_app.sh` 
 ## Build locally
 
 All commands run from the **repo root**. Build the dashboard first so the UI is
-bundled (optional — the spec warns and builds without it if absent):
+bundled (optional — the spec warns and builds without it if absent). This is an
+npm workspaces monorepo (lockfile at root):
 
 ```bash
-npm --prefix dashboard ci && npm --prefix dashboard run build
+npm ci && npm --workspace dashboard run build
 ```
+
+For day-to-day macOS use, `./build_app.sh` already does that before packaging
+the alias `.app`.
 
 ### macOS (arm64 or Intel)
 
