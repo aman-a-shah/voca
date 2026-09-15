@@ -49,11 +49,12 @@ The macOS Apple-Silicon experience is documented in detail below.
 ./build_app.sh
 ```
 
-This builds **`dist/Voca.app`** (via py2app). Double-click it: a 🎙️
-icon appears in your menu bar and it runs quietly in the background. macOS asks
-for **Microphone** access on first launch — click **Allow**. Then hold `fn`,
-speak, release — done. Click the menu-bar icon for status, the last
-transcription, and **Quit**.
+This installs JS deps, builds the in-app dashboard, and produces
+**`dist/Voca.app`** (via py2app). Double-click it: a 🎙️ icon appears in your
+menu bar and it runs quietly in the background. macOS asks for **Microphone**
+access on first launch — click **Allow**. Then hold `fn`, speak, release —
+done. Click the menu-bar icon for status, the last transcription, **Open
+Dashboard…**, and **Quit**.
 
 > Built with py2app so macOS attributes Microphone/Accessibility permissions to
 > *this app* (a plain shell wrapper hands that identity to the shared system

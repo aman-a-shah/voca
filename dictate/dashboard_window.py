@@ -49,7 +49,8 @@ _PLACEHOLDER = """<!doctype html><html><head><meta charset="utf-8">
   code{background:#1b1b22;padding:.15rem .4rem;border-radius:.35rem}
 </style></head><body><div class="card">
   <h1>Dashboard not built yet</h1>
-  <p>Run <code>npm --prefix dashboard run build</code> to generate it, then reopen.</p>
+  <p>From the repo root run <code>./build_app.sh</code> (or
+  <code>npm ci &amp;&amp; npm --workspace dashboard run build</code>), then reopen.</p>
 </div></body></html>"""
 
 

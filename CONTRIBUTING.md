@@ -25,10 +25,10 @@ welcome.
 ./build_app.sh
 ```
 
-This builds and lets you run the macOS menu-bar app. For quick iteration in a
-terminal (with `DICTATE_*` config), use `./dictate.sh`. The first run creates a
-virtualenv, installs dependencies, and downloads the Whisper model (~1.6 GB,
-cached afterward).
+This builds the dashboard UI and the macOS menu-bar app in one step. For quick
+iteration in a terminal (with `DICTATE_*` config), use `./dictate.sh`. The first
+run creates a virtualenv, installs dependencies (Python + npm), and downloads
+the Whisper model (~1.6 GB, cached afterward).
 
 > One install only: build and run the `/Applications` copy. Do not run a signed
 > duplicate out of `dist/` — on macOS that creates a second bundle that hijacks
